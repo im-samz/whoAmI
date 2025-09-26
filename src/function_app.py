@@ -1,80 +1,111 @@
-import base64
 import json
 import logging
 import os
-import urllib.parse
+from datetime import datetime, timedelta
+from typing import Dict, List, Any
 
 import azure.functions as func
 from azure.identity import DefaultAzureCredential
 from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
 from azure.kusto.data.exceptions import KustoServiceError
-import requests
 
 # Initialize the Function App
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-# Constants for the whoAmI function
-_INCLUDE_EMAIL_PROPERTY_NAME = "includeEmail"
-
-# Constants for the Kusto query function
-_QUERY_PROPERTY_NAME = "query"
+# Constants for common parameters
+_TIME_RANGE_PROPERTY_NAME = "timeRange"
+_SUBSCRIPTION_ID_PROPERTY_NAME = "subscriptionId"
+_LIMIT_PROPERTY_NAME = "limit"
+DEFAULT_RESULT_LIMIT = 100
 
 # Define a class to represent tool properties
 class ToolProperty:
-    def __init__(self, property_name: str, property_type: str, description: str):
-        self.propertyName = property_name
-        self.propertyType = property_type
+    """Represents a tool property with name, type, and description."""
+    
+    def __init__(self, property_name: str, property_type: str, description: str) -> None:
+        self.property_name = property_name
+        self.property_type = property_type
         self.description = description
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, str]:
+        """Convert the tool property to a dictionary representation."""
         return {
-            "propertyName": self.propertyName,
-            "propertyType": self.propertyType,
+            "propertyName": self.property_name,
+            "propertyType": self.property_type,
             "description": self.description,
         }
 
-# Helper function to get access token
-def get_access_token():
+# Helper function to parse time range and convert to Kusto datetime
+def parse_time_range(time_range: str) -> str:
     """
-    Get an access token for Microsoft Graph.
-    Uses DefaultAzureCredential for local development and EasyAuth headers for Azure deployment.
-    """
-    # Check if running in Azure (EasyAuth headers present)
-    if os.getenv("HTTP_X_MS_TOKEN_AAD_ACCESS_TOKEN"):
-        # Use EasyAuth token when deployed to Azure
-        access_token = os.getenv("HTTP_X_MS_TOKEN_AAD_ACCESS_TOKEN")
-        logging.info("Using EasyAuth authentication")
-        return access_token
-    else:
-        # Use DefaultAzureCredential for local development
-        credential = DefaultAzureCredential()
-        logging.info("Using DefaultAzureCredential for local development")
-        token = credential.get_token("https://graph.microsoft.com/.default")
-        return token.token
-
-
-# Helper function to format user information
-def format_user_info(display_name: str, email: str = None, include_email: bool = False) -> str:
-    """
-    Format user information based on the include_email parameter.
+    Parse time range parameter and return a Kusto-compatible datetime string.
     
     Args:
-        display_name: The user's display name
-        email: The user's email address (optional)
-        include_email: Whether to include email in the result
+        time_range: Time range in format like "7d", "24h", "30m" or default to "7d"
     
     Returns:
-        Formatted user information string
+        Kusto datetime string for the start time
     """
-    if include_email and email:
-        return f"{display_name} ({email})"
-    return display_name
+    if not time_range:
+        time_range = "7d"  # Default to 7 days
+    
+    # Parse the time range
+    unit = time_range[-1].lower()
+    try:
+        value = int(time_range[:-1])
+    except ValueError:
+        # Default to 7 days if parsing fails
+        value = 7
+        unit = 'd'
+    
+    # Calculate start time
+    now = datetime.utcnow()
+    if unit == 'd':
+        start_time = now - timedelta(days=value)
+    elif unit == 'h':
+        start_time = now - timedelta(hours=value)
+    elif unit == 'm':
+        start_time = now - timedelta(minutes=value)
+    else:
+        # Default to days
+        start_time = now - timedelta(days=value)
+    
+    return start_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+# Helper function to generate Kusto queries
+def generate_function_apps_query(start_time: str, subscription_id: str, limit: int = DEFAULT_RESULT_LIMIT) -> str:
+    """
+    Generate a Kusto query to find recent active Function Apps.
+    
+    Args:
+        start_time: Start time in Kusto datetime format
+        subscription_id: Required subscription ID filter
+        limit: Maximum number of results to return (default: 100)
+    
+    Returns:
+        Kusto query string
+    """
+    # Build the query with proper escaping and formatting
+    query_lines = [
+        "WawsAn_omgsiteentity",
+        f"| where pdate >= datetime('{start_time}')",
+        "| where IsFunction == 1",
+        "| where IsActive == 1", 
+        f"| where Subscription == '{subscription_id}'",
+        "| distinct SiteName",
+        f"| take {limit}"
+    ]
+    
+    return "\n".join(query_lines)
 
 # Helper function to get Kusto access token
-def get_kusto_access_token():
+def get_kusto_access_token() -> str:
     """
     Get an access token for Azure Data Explorer (Kusto).
     Uses DefaultAzureCredential for local development and EasyAuth headers for Azure deployment.
+    
+    Returns:
+        Access token string for Kusto authentication
     """
     # Check if running in Azure (EasyAuth headers present)
     if os.getenv("HTTP_X_MS_TOKEN_AAD_ACCESS_TOKEN"):
@@ -89,134 +120,29 @@ def get_kusto_access_token():
         token = credential.get_token("https://help.kusto.windows.net/.default")
         return token.token
 
-# Helper function to decode the query parameter
-def decode_query(encoded_query: str) -> str:
-    """
-    Decode the URL-encoded query parameter.
-    
-    Args:
-        encoded_query: The URL-encoded query string
-    
-    Returns:
-        Decoded query string
-    """
-    try:
-        return urllib.parse.unquote(encoded_query)
-    except Exception as e:
-        logging.error(f"Failed to decode query: {str(e)}")
-        return encoded_query  # Return as-is if decoding fails
-
-# Define the tool properties using the ToolProperty class
-tool_properties_who_am_i_object = [
-    ToolProperty(_INCLUDE_EMAIL_PROPERTY_NAME, "boolean", "Whether to include email address in the response.")
+# Define the tool properties for Function Apps monitoring
+tool_properties_function_apps_object: List[ToolProperty] = [
+    ToolProperty(_TIME_RANGE_PROPERTY_NAME, "string", "Time range to search as a string with number followed by unit: 'd' for days, 'h' for hours, 'm' for minutes. Examples: '7d' (7 days), '24h' (24 hours), '30m' (30 minutes). If not provided, defaults to '7d'."),
+    ToolProperty(_SUBSCRIPTION_ID_PROPERTY_NAME, "string", "Azure subscription ID as a GUID string (e.g., '12345678-1234-1234-1234-123456789abc'). This parameter is required to scope the search to a specific Azure subscription."),
+    ToolProperty(_LIMIT_PROPERTY_NAME, "integer", "Maximum number of Function Apps to return. If not provided, defaults to 100.")
 ]
 
 # Convert the tool properties to JSON
-tool_properties_who_am_i_json = json.dumps([prop.to_dict() for prop in tool_properties_who_am_i_object])
-
-# Define the tool properties for the Kusto query function
-tool_properties_kusto_query_object = [
-    ToolProperty(_QUERY_PROPERTY_NAME, "string", "The encoded Kusto query to execute against the database.")
-]
-
-# Convert the tool properties to JSON
-tool_properties_kusto_query_json = json.dumps([prop.to_dict() for prop in tool_properties_kusto_query_object])
+tool_properties_function_apps_json: str = json.dumps([prop.to_dict() for prop in tool_properties_function_apps_object])
 
 
-@app.generic_trigger(
-    arg_name="context",
-    type="mcpToolTrigger",
-    toolName="whoAmI",
-    description="Determine who I am by searching Microsoft Graph.",
-    toolProperties=tool_properties_who_am_i_json,
-)
-def who_am_i(context) -> str:
+# Helper function to execute Kusto queries
+def execute_kusto_query(query: str) -> str:
     """
-    Determines who the current user is by querying Microsoft Graph.
-    Uses DefaultAzureCredential for local development and EasyAuth for Azure deployment.
-
+    Execute a Kusto query and return results as JSON.
+    
     Args:
-        context: The trigger context containing the input arguments.
-
+        query: The Kusto query to execute
+    
     Returns:
-        str: The display name of the current user (optionally with email) or an error message.
+        JSON string with query results or error message
     """
     try:
-        # Parse the context to get arguments
-        content = json.loads(context)
-        include_email = content.get("arguments", {}).get(_INCLUDE_EMAIL_PROPERTY_NAME, False)
-        
-        # Check if running in Azure (EasyAuth headers present)
-        if os.getenv("HTTP_X_MS_TOKEN_AAD_ACCESS_TOKEN"):
-            # For Azure deployment with EasyAuth
-            user_principal = os.getenv("HTTP_X_MS_CLIENT_PRINCIPAL")
-            if not user_principal:
-                return "No user principal found in EasyAuth headers"
-                
-            decoded_principal = base64.b64decode(user_principal).decode('utf-8')
-            principal_data = json.loads(decoded_principal)
-            display_name = principal_data.get("name", "Unknown User")
-            email = principal_data.get("email")
-            
-            result = format_user_info(display_name, email, include_email)
-            logging.info(f"Successfully retrieved user info from EasyAuth: {result}")
-            return result
-        else:
-            # For local development with DefaultAzureCredential
-            access_token = get_access_token()
-            
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            }
-            
-            response = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
-            
-            if response.status_code != 200:
-                return f"Failed to get user info: {response.status_code} - {response.text}"
-                
-            user_info = response.json()
-            display_name = user_info.get("displayName", "Unknown User")
-            email = user_info.get("mail") or user_info.get("userPrincipalName")
-            
-            result = format_user_info(display_name, email, include_email)
-            logging.info(f"Successfully retrieved user info: {result}")
-            return result
-                
-    except Exception as e:
-        error_msg = f"Error determining user identity: {str(e)}"
-        logging.error(error_msg)
-        return error_msg
-
-
-@app.generic_trigger(
-    arg_name="context",
-    type="mcpToolTrigger",
-    toolName="kustoQuery",
-    description="Execute a query against a Kusto database and return the results.",
-    toolProperties=tool_properties_kusto_query_json,
-)
-def kusto_query(context) -> str:
-    """
-    Executes a query against a Kusto database.
-    Uses DefaultAzureCredential for local development and EasyAuth for Azure deployment.
-
-    Args:
-        context: The trigger context containing the input arguments including the encoded query.
-
-    Returns:
-        str: The query results as JSON or an error message.
-    """
-    try:
-        # Parse the context to get arguments
-        content = json.loads(context)
-        encoded_query = content.get("arguments", {}).get(_QUERY_PROPERTY_NAME)
-        
-        if not encoded_query:
-            return "Error: No query provided in the request"
-        
-        # Decode the query
-        query = decode_query(encoded_query)
         logging.info(f"Executing Kusto query: {query[:100]}...")  # Log first 100 chars for debugging
         
         # Get environment variables for Kusto configuration
@@ -263,5 +189,60 @@ def kusto_query(context) -> str:
         return error_msg
     except Exception as e:
         error_msg = f"Error executing Kusto query: {str(e)}"
+        logging.error(error_msg)
+        return error_msg
+
+
+@app.generic_trigger(
+    arg_name="context",
+    type="mcpToolTrigger",
+    toolName="getRecentActiveFunctionApps",
+    description="Get Function Apps that have been active recently with their activity details.",
+    toolProperties=tool_properties_function_apps_json,
+)
+def get_recent_active_function_apps(context: str) -> str:
+    """
+    Get Function Apps that have been active recently.
+
+    Args:
+        context: The trigger context containing time range and required subscription ID.
+
+    Returns:
+        str: JSON with active Function Apps or an error message.
+    """
+    try:
+        # Parse the context to get arguments
+        content = json.loads(context)
+        arguments = content.get("arguments", {})
+        
+        time_range = arguments.get(_TIME_RANGE_PROPERTY_NAME, "7d")
+        subscription_id = arguments.get(_SUBSCRIPTION_ID_PROPERTY_NAME)
+        limit = arguments.get(_LIMIT_PROPERTY_NAME, DEFAULT_RESULT_LIMIT)
+        
+        # Validate required parameters
+        if not subscription_id:
+            return "Error: subscriptionId parameter is required"
+        
+        # Validate and convert limit to integer
+        try:
+            limit = int(limit)
+            if limit <= 0:
+                limit = DEFAULT_RESULT_LIMIT
+        except (ValueError, TypeError):
+            limit = DEFAULT_RESULT_LIMIT
+        
+        # Generate the start time
+        start_time = parse_time_range(time_range)
+        
+        # Generate and execute the query
+        query = generate_function_apps_query(start_time, subscription_id, limit)
+        return execute_kusto_query(query)
+                
+    except json.JSONDecodeError as e:
+        error_msg = f"Error parsing JSON context: {str(e)}"
+        logging.error(error_msg)
+        return error_msg
+    except Exception as e:
+        error_msg = f"Error getting active Function Apps: {str(e)}"
         logging.error(error_msg)
         return error_msg
