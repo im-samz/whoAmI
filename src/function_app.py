@@ -60,6 +60,9 @@ def format_user_info(display_name: str, email: str = None, include_email: bool =
     Returns:
         Formatted user information string
     """
+    if include_email and email:
+        return f"{display_name} ({email})"
+    return display_name
 
 # Define the tool properties using the ToolProperty class
 tool_properties_who_am_i_object = [
